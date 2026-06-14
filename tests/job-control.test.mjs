@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  isStreamableProgressLine,
   resolveCancelableJob,
   resolveResultJob
 } from "../plugins/codex/scripts/lib/job-control.mjs";
@@ -240,5 +241,35 @@ describe("multi-root state scan", () => {
       .map((job) => job.id)
       .sort();
     assert.deepEqual(ids, ["task-legacy", "task-primary"]);
+  });
+});
+
+describe("isStreamableProgressLine (#372 stderr filter)", () => {
+  // The foreground task observer tails the job log to stderr for live progress.
+  // It must echo only progress lines, never the persisted block bodies (assistant
+  // message, Final output, reasoning), or it duplicates Codex's answer onto stderr
+  // alongside the rendered stdout result.
+  it("keeps timestamped progress lines", () => {
+    assert.equal(isStreamableProgressLine("[2026-06-13T06:15:39.925Z] Starting Codex Task."), true);
+    assert.equal(isStreamableProgressLine("[2026-06-13T06:15:42.000Z] Turn completed."), true);
+    assert.equal(isStreamableProgressLine("[2026-06-13T06:15:43.000Z] Assistant message captured: OK"), true);
+  });
+
+  it("drops block titles whose bodies render on stdout", () => {
+    assert.equal(isStreamableProgressLine("[2026-06-13T06:15:43.000Z] Final output"), false);
+    assert.equal(isStreamableProgressLine("[2026-06-13T06:15:43.000Z] Assistant message"), false);
+    assert.equal(isStreamableProgressLine("[2026-06-13T06:15:43.000Z] Reasoning summary"), false);
+    assert.equal(isStreamableProgressLine("[2026-06-13T06:15:43.000Z] Subagent design-challenger message"), false);
+  });
+
+  it("drops block-body lines, including ones that start with a bracket (#372)", () => {
+    assert.equal(isStreamableProgressLine("OK"), false);
+    assert.equal(isStreamableProgressLine("the full assistant answer body line"), false);
+    assert.equal(isStreamableProgressLine("[1] https://example.com a markdown reference"), false);
+    assert.equal(isStreamableProgressLine("[P2] a finding Codex wrote in its answer"), false);
+    assert.equal(isStreamableProgressLine('["a", "b", "c"]'), false);
+    assert.equal(isStreamableProgressLine("[2026-06-13] partial date only"), false);
+    assert.equal(isStreamableProgressLine(""), false);
+    assert.equal(isStreamableProgressLine(null), false);
   });
 });
