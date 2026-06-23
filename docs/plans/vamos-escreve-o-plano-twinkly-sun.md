@@ -372,6 +372,22 @@ gitignored, sem tocar `codex-ws.mjs` nem o app-server `:4500`; o proposer roda n
   chamadas ao proposer), ou o proposer devolver o **subconjunto verificável** + escopo de
   "execução parcial".
 
+### v1.5 — feito (validado pelo self-test do Driver sobre si mesmo)
+- **Per-AC assessment + estado `partial`** (resolve o descompasso acima): o proposer avalia
+  cada AC; o driver decide `pending`/`partial`/`needs_planning` (`decideFromAssessment`).
+- **S2 — separação dura no output:** blocos "▶ Execução automática (N ACs + verify)" vs
+  "⏸ Requer sign-off humano (M ACs — NÃO automatizar)" (`splitAcs`) — um `partial` nunca
+  promove execução incompleta.
+- **S4 — verify_plan por stack:** `detectStack` (Gemfile→rails, package.json→node) — não
+  mais `bin/rspec` hardcoded. (33/33 testes.)
+
+### Backlog v1.5 (notas, não feito)
+- **S3** — marcadores `✓/✗` frágeis em saída ASCII pura → opcional `--ascii` / `[x]`/`[ ]`.
+- **S6** — gate determinístico leniente gasta 1 turn em tasks que viram needs_planning →
+  apertar para "maioria verificável" pouparia cota (otimização, não correção).
+- **S1** — versionar o schema do proposer se virar contrato compartilhado (hoje moot:
+  único consumidor é o `driver.mjs`).
+
 ### Próximo passo
-v1.5 (opcional): resolver o descompasso acima; depois, medir a **métrica de utilidade
-(§10)** em N rodadas reais antes de habilitar `approve --write-inbox`.
+Medir a **métrica de utilidade (§10)** em N rodadas reais antes de habilitar
+`approve --write-inbox` (a primeira escrita).
