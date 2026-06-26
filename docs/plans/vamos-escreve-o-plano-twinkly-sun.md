@@ -581,6 +581,13 @@ repo rastreado, baseline versionada compartilhada (isso é B). Fasear: **v1 = A*
 
 ## 20. Changelog do Documento
 
+### 2026-06-25 — §21 camada de transporte MCP / job-relay
+- Adicionada a **§21**: plano da camada de transporte (MCP como fachada + job-relay durável),
+  já com a **review adversarial do Codex** (`solido_com_mudancas`) embutida e o **right-sizing**
+  (não construir o roteador multi-máquina; reusar `state.mjs`/`event-stream`/`broker-lifecycle` —
+  ~75% do durável já existe — + fachada MCP fina; manter `codex-ws`).
+- Backlog: `doc-1` (design) + `task-1` (iniciativa) criados no Backlog.md; as subtasks derivam da §21.
+
 ### 2026-06-24 — princípio de comunicação + camada de verificação
 - Cabeçalho: adicionado o **princípio de comunicação em linguagem de design de negócio** — o
   acompanhamento e os handoffs Claude↔Codex narram *o que acontece e por que importa*, com o
@@ -620,3 +627,113 @@ repo rastreado, baseline versionada compartilhada (isso é B). Fasear: **v1 = A*
   `partial` quando há subconjunto automatizável, `needs_planning` quando nenhum é verificável.
 - Marcadas as seções de cutline/checklist como **históricas** e sujeitas a revalidação antes
   de qualquer promoção para `approve --write-inbox`.
+
+---
+
+## 21. Camada de transporte MCP / job-relay (plano — "novo plugin + MCP")
+
+> Plano de implementação da **camada de transporte** do plugin. Passou pela estrutura de revisão do
+> projeto (design record + **review adversarial do Codex**, veredito `solido_com_mudancas`). Backlog:
+> `doc-1` (design) + `task-1` (iniciativa) no Backlog.md — as subtasks de implementação derivam desta seção.
+
+### Contexto (por que)
+
+O transporte do plugin é **fragmentado**: `codex-ws` (WebSocket ao app-server do Codex, ponto-a-ponto,
+mesma máquina), inbox de arquivos + daemon `inbox-watcher` (tmux send-keys), e `review-loop`. Dói
+"ficar conectando" e **não há garantias de mensageria** (entrega/retry/dedup/ordem/durabilidade) — são
+informais e quebram em casos reais. Alvo: uma camada única, com **MCP como fachada** e uma **fila de
+jobs durável** por baixo.
+
+**A descoberta que define o escopo:** ~70-75% do "job-relay durável" **já existe** no plugin
+(`state.mjs`, `event-stream.mjs`, `tracked-jobs.mjs`, `broker-lifecycle.mjs`). Então isto é mais
+**reuso + uma fachada MCP fina** do que um sistema novo.
+
+### Decisão de escopo (right-sized, do Codex)
+
+NÃO construir o roteador MCP multi-máquina completo. **v1 = job-relay durável (reusando o que existe)
++ fachada MCP local**, mantendo `codex-ws` para a chamada síncrona ao servidor Codex. Multi-máquina +
+segurança cross-machine = **fase futura** (só compensa quando a meta for multi-máquina/multi-agente/
+auditável; antes é over-engineering).
+
+**Princípios (Codex):** MCP é **fachada, não barramento**; base **assíncrona** (`dispatch → job_id →
+poll/subscribe`), síncrono (`dispatch_and_wait`) só conveniência; o resultado vira **job durável antes
+de responder**; worker-servidor (Codex app-server) não precisa de loop, worker-interativo (sessão
+Claude) precisa.
+
+### Arquitetura (v1)
+
+```
+ Claude (cliente MCP)         RELAY (daemon — reusa broker-lifecycle)        Codex app-server
+   │ dispatch(to, task, request_id) │                                            │
+   ├───────────────────────────────►│ upsertJob (dedup por request_id) → job_id  │
+   │            job_id               │ (state.mjs — durável em disco)             │
+   │◄───────────────────────────────┤                                            │
+   │ poll(job_id) / subscribe(res)   │  (sync) codex-ws turn/start ──────────────►│
+   │                                 │  grava result no job ANTES de responder    │
+   │◄──── result (poll/subscribe) ───┤◄──────────── turn/completed ───────────────┤
+```
+
+- **Relay = daemon** (mesmo padrão do broker: `relay.json` com endpoint, spawn detached+unref, reusa-se-vivo).
+- **Fachada MCP** (declarada no `plugin.json` p/ Claude Code/Codex descobrirem): `register_agent`,
+  `dispatch → job_id`, `poll(job_id)`/`status`, inbox como **resource** com subscription;
+  `dispatch_and_wait(timeout)` como atalho.
+- **Store durável = `state.mjs` (arquivo)** — já durável em disco por-workspace. v1 single-machine
+  **não precisa de Postgres/Redis** (Codex listou esses só p/ o barramento de verdade, fase multi-máquina).
+- **Chamada síncrona ao Codex = `codex-ws`/`ws-appserver.mjs`** (o relay grava o result como job durável antes de responder).
+
+### Reuso vs. novo (o que mantém enxuto)
+
+| Reusar (≈75% do durável) | De onde |
+|---|---|
+| Job records + persistência por-workspace | `lib/state.mjs` (`upsertJob`, `loadState`, cap `MAX_JOBS=50`) |
+| Log de eventos durável → fonte do subscribe | `lib/event-stream.mjs` (`.events.jsonl`, `emitEvent`) |
+| Wrapper de execução + progress | `lib/tracked-jobs.mjs` (`runTrackedJob`, progress reporter) |
+| Daemon detached + endpoint + reusa-se-vivo | `lib/broker-lifecycle.mjs` (`ensureBrokerSession`) |
+| Chamada ao servidor Codex | `tools/codex-ws.mjs`, `lib/ws-appserver.mjs` |
+
+| Novo (o delta real) | Escopo |
+|---|---|
+| `request_id` + dedup | hoje dedup só por `id`; add chave (workspace, request_id) + result cacheado |
+| Fila/claim (`queued/claimed/running/completed/failed/cancelled/expired`) | claim/release/complete + claim TTL (hoje o job spawna na hora) |
+| **Fachada MCP** | servidor MCP (JSON-RPC initialize/call_tool/subscribe), tools enqueue/status/subscribe, **declarado no `plugin.json`** (hoje o plugin é CLI-only, sem MCP) |
+| Contrato do worker-loop | p/ worker interativo (sessão Claude) puxar a mailbox |
+| Migração | `review-loop` + inbox-handoff passam ao relay; `inbox-watcher`/tmux aposentado |
+
+### Breakdown de implementação (deriva as subtasks de `task-1`)
+
+1. **Job-relay durável** — estender `state.mjs`/`tracked-jobs.mjs` com `request_id`/dedup + estados de fila/claim + TTL (reuso pesado). `[high]`
+2. **Fachada MCP** sobre o relay — servidor MCP (register/dispatch/poll/status + inbox-resource), declarado no `plugin.json`. `[high]` (dep: 1)
+3. **Dispatch** — async (`job_id`/poll/subscribe) como **base** + `dispatch_and_wait` conveniência via `codex-ws` (grava job durável antes de responder) + contrato do worker-loop. `[high]` (dep: 1,2)
+4. **Migração** — `review-loop`/inbox no relay; aposentar `inbox-watcher`/tmux; manter `codex-ws`. `[medium]` (dep: 3)
+5. **Cross-machine** (futuro/gated) — auth, authz por agente/projeto, isolamento de workspace, auditoria, anti-injeção. `[low]` (dep: 2)
+
+### Guardrails (Codex) que o plano carrega
+
+Estados de job explícitos; idempotência/dedup por `request_id`; persistência durável (reusa
+`state.mjs`); backpressure/TTL (reusa `MAX_JOBS`); contrato de timeout (dispatch curto, poll longo);
+log auditável (reusa `event-stream`); separar **coordenação vs execução-com-escrita**; fallback quando
+o Codex app-server cai. **MCP = fachada, não barramento.**
+
+### Arquivos críticos
+
+- Estender: `plugins/codex/scripts/lib/state.mjs` · `tracked-jobs.mjs` · `event-stream.mjs` (job-relay).
+- Reusar padrão: `plugins/codex/scripts/lib/broker-lifecycle.mjs` · `broker-endpoint.mjs` (daemon do relay).
+- Chamada síncrona ao Codex: `plugins/codex/scripts/lib/ws-appserver.mjs` / `tools/codex-ws.mjs`.
+- Declarar o MCP: `plugins/codex/.claude-plugin/plugin.json` (**verificar o campo de manifesto MCP do Claude Code**).
+- **Novo:** `plugins/codex/scripts/relay/` (job-queue + fachada MCP) + um entrypoint `relay-serve.mjs`.
+
+### Verificação (ponta a ponta)
+
+1. **Unit (`node --test`):** ciclo de job (queued→…→completed/failed/cancelled), **dedup por `request_id`**
+   (mesmo id 2× → 1 job/1 result), claim/release.
+2. **Round-trip real** (porta dedicada, **não** o `:4500` vivo): cliente MCP → relay → `codex-ws` →
+   Codex app-server → job durável → result (via `poll` e via `subscribe`).
+3. **Idempotência sob falha:** matar o relay no meio → o job sobrevive em disco e o result é recuperável.
+4. **Paridade de migração:** `review-loop` via relay == comportamento do caminho antigo.
+5. `npm test` + `npm run build` verdes.
+
+### Fora de escopo (v1)
+
+Roteador MCP multi-máquina; substrato de fila dedicado (Postgres/Redis/NATS/Temporal — só na fase
+multi-máquina); segurança cross-machine; worker-pool/scheduling avançado. **Mantém-se `codex-ws`** para
+a chamada ao servidor Codex (não reinventar).
