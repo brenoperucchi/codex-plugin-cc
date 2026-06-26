@@ -85,7 +85,7 @@ function nowMs(clock) {
 }
 
 function defaultStore() {
-  return { version: STORE_VERSION, jobs: [], index: {} };
+  return { version: STORE_VERSION, jobs: [], index: {}, agents: {} };
 }
 
 // The index is DERIVED from jobs (jobs are the source of truth), so it can never
@@ -105,7 +105,8 @@ function normalizeStore(parsed) {
   const store = {
     version: STORE_VERSION,
     jobs: Array.isArray(parsed?.jobs) ? parsed.jobs.filter((job) => job && job.id) : [],
-    index: {}
+    index: {},
+    agents: parsed?.agents && typeof parsed.agents === "object" ? { ...parsed.agents } : {}
   };
   return rebuildIndex(store);
 }
@@ -152,7 +153,7 @@ function persistStore(cwd, store) {
   const file = relayStateFile(cwd);
   const dir = path.dirname(file);
   const tmp = path.join(dir, `.${STORE_FILE_NAME}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`);
-  const data = `${JSON.stringify({ version: STORE_VERSION, jobs: store.jobs, index: store.index }, null, 2)}\n`;
+  const data = `${JSON.stringify({ version: STORE_VERSION, jobs: store.jobs, index: store.index, agents: store.agents ?? {} }, null, 2)}\n`;
   const fd = fs.openSync(tmp, "w");
   try {
     fs.writeFileSync(fd, data);
@@ -626,4 +627,58 @@ export function findByRequestId(cwd, requestId, opts = {}) {
 
 export function list(cwd, opts = {}) {
   return withStore(cwd, (store) => ({ result: store.jobs.map(snapshot), changed: false }), opts);
+}
+
+// --- agent registry (powers the MCP facade's inbox resources) ------------
+
+// Persisting registered agents makes an agent's inbox discoverable BEFORE any
+// job is addressed to it (avoids a subscribe/dispatch race in the facade).
+export function registerAgent(cwd, agentId, opts = {}) {
+  if (!agentId) {
+    throw new RelayStoreError("registerAgent requer um agentId", { code: "MISSING_AGENT_ID" });
+  }
+  return withStore(
+    cwd,
+    (store, now) => {
+      if (!store.agents) {
+        store.agents = {};
+      }
+      const existing = store.agents[agentId];
+      store.agents[agentId] = {
+        registeredAt: existing?.registeredAt ?? now,
+        lastSeen: now
+      };
+      return {
+        result: { agentId, inboxUri: `relay://inbox/${encodeURIComponent(agentId)}`, ...store.agents[agentId] },
+        changed: true
+      };
+    },
+    opts
+  );
+}
+
+export function listAgents(cwd, opts = {}) {
+  return withStore(
+    cwd,
+    (store) => ({
+      result: Object.entries(store.agents ?? {}).map(([agentId, meta]) => ({ agentId, ...meta })),
+      changed: false
+    }),
+    opts
+  );
+}
+
+// An agent's inbox: the jobs currently queued (claimable) for that agent.
+export function inboxFor(cwd, agentId, { limit = 100, ...opts } = {}) {
+  return withStore(
+    cwd,
+    (store) => ({
+      result: store.jobs
+        .filter((job) => job.to === agentId && job.relayState === "queued")
+        .slice(0, Math.max(0, limit))
+        .map(snapshot),
+      changed: false
+    }),
+    opts
+  );
 }
