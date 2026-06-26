@@ -61,9 +61,16 @@ export const RELAY_STATES = Object.freeze([
   "completed",
   "failed",
   "cancelled",
-  "expired"
+  "expired",
+  "needs_recovery"
 ]);
-export const TERMINAL_STATES = Object.freeze(["completed", "failed", "cancelled", "expired"]);
+export const TERMINAL_STATES = Object.freeze([
+  "completed",
+  "failed",
+  "cancelled",
+  "expired",
+  "needs_recovery"
+]);
 const TERMINAL = new Set(TERMINAL_STATES);
 
 const DEFAULT_MAX_ATTEMPTS = 5;
@@ -263,31 +270,49 @@ function sweepStore(store, now, { retentionMs = DEFAULT_RETENTION_MS, maxJobs = 
     }
     // Job TTL (measured from enqueue) takes precedence over lease handling.
     if (job.ttlMs != null && now - job.enqueuedAtMs > job.ttlMs) {
-      job.relayState = "expired";
+      const running = job.relayState === "claimed" || job.relayState === "running";
+      if (running && job.leaseExpiryPolicy === "park") {
+        // A write job still in flight may have partially written — preserve the
+        // recovery signal instead of a plain "expired".
+        job.relayState = "needs_recovery";
+        job.errorMessage = "TTL expirado em job park em execução — requer recover()";
+        events.push({ jobId: job.id, type: "relay_needs_recovery" });
+      } else {
+        job.relayState = "expired";
+        events.push({ jobId: job.id, type: "relay_expired" });
+      }
       job.terminalAtMs = now;
       job.updatedAtMs = now;
       job.claim = null;
-      events.push({ jobId: job.id, type: "relay_expired" });
       continue;
     }
-    // Lease expiry → requeue (or fail past max attempts).
+    // Lease expiry.
     if (
       (job.relayState === "claimed" || job.relayState === "running") &&
       job.claim &&
       job.claim.leaseExpiresAtMs != null &&
       now > job.claim.leaseExpiresAtMs
     ) {
-      job.attempts += 1;
       job.claim = null;
       job.updatedAtMs = now;
-      if (job.attempts >= job.maxAttempts) {
-        job.relayState = "failed";
-        job.errorMessage = "lease expirado após o número máximo de tentativas";
+      if (job.leaseExpiryPolicy === "park") {
+        // Write/side-effecting job whose owner may have died mid-run: never
+        // auto re-run; park for explicit recovery.
+        job.relayState = "needs_recovery";
+        job.errorMessage = "lease expirada (job park) — requer recover() explícito";
         job.terminalAtMs = now;
-        events.push({ jobId: job.id, type: "relay_failed" });
+        events.push({ jobId: job.id, type: "relay_needs_recovery" });
       } else {
-        job.relayState = "queued";
-        events.push({ jobId: job.id, type: "relay_requeued" });
+        job.attempts += 1;
+        if (job.attempts >= job.maxAttempts) {
+          job.relayState = "failed";
+          job.errorMessage = "lease expirado após o número máximo de tentativas";
+          job.terminalAtMs = now;
+          events.push({ jobId: job.id, type: "relay_failed" });
+        } else {
+          job.relayState = "queued";
+          events.push({ jobId: job.id, type: "relay_requeued" });
+        }
       }
     }
   }
@@ -368,7 +393,11 @@ function snapshot(job) {
 
 // --- public API ----------------------------------------------------------
 
-export function enqueue(cwd, { requestId, to = null, payload = null, ttlMs = null, maxAttempts } = {}, opts = {}) {
+export function enqueue(
+  cwd,
+  { requestId, to = null, payload = null, ttlMs = null, maxAttempts, leaseExpiryPolicy = "requeue" } = {},
+  opts = {}
+) {
   if (!requestId) {
     throw new RelayStoreError("enqueue requer um requestId (chave de idempotência)", { code: "MISSING_REQUEST_ID" });
   }
@@ -394,6 +423,9 @@ export function enqueue(cwd, { requestId, to = null, payload = null, ttlMs = nul
         terminalAtMs: null,
         ttlMs: ttlMs ?? null,
         maxAttempts: maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
+        // On lease expiry: "requeue" (safe, read-only) or "park" → needs_recovery
+        // (for side-effecting/write jobs that must NOT auto re-run).
+        leaseExpiryPolicy: leaseExpiryPolicy === "park" ? "park" : "requeue",
         attempts: 0,
         claim: null,
         completedByToken: null,
@@ -603,6 +635,65 @@ export function cancel(cwd, jobId, opts = {}) {
       return {
         result: { ok: true, job: snapshot(job) },
         events: [{ jobId: job.id, type: "relay_cancelled" }],
+        changed: true
+      };
+    },
+    opts
+  );
+}
+
+// Park a running job for explicit recovery (used when a write job is aborted by
+// a timeout): never auto re-run. Fenced by the current claim token.
+export function park(cwd, jobId, claimToken, errorMessage = null, opts = {}) {
+  return withStore(
+    cwd,
+    (store, now) => {
+      const job = findJob(store, jobId);
+      if (!job) {
+        return { result: { ok: false, reason: "not_found", job: null }, changed: false };
+      }
+      if (TERMINAL.has(job.relayState)) {
+        return { result: { ok: false, reason: "already_terminal", job: snapshot(job) }, changed: false };
+      }
+      if (job.relayState !== "claimed" && job.relayState !== "running") {
+        return { result: { ok: false, reason: "not_claimed", job: snapshot(job) }, changed: false };
+      }
+      if (!job.claim || job.claim.claimToken !== claimToken) {
+        return { result: { ok: false, reason: "stale_claim_token", job: snapshot(job) }, changed: false };
+      }
+      job.relayState = "needs_recovery";
+      job.errorMessage = errorMessage ?? "parked para recuperação explícita";
+      job.terminalAtMs = now;
+      job.claim = null;
+      job.updatedAtMs = now;
+      return {
+        result: { ok: true, job: snapshot(job) },
+        events: [{ jobId: job.id, type: "relay_needs_recovery" }],
+        changed: true
+      };
+    },
+    opts
+  );
+}
+
+// Explicitly move a needs_recovery job back to queued (a human/operator decision).
+export function recover(cwd, jobId, opts = {}) {
+  return withStore(
+    cwd,
+    (store, now) => {
+      const job = findJob(store, jobId);
+      if (!job || job.relayState !== "needs_recovery") {
+        return { result: { ok: false, job: snapshot(job) }, changed: false };
+      }
+      job.relayState = "queued";
+      job.claim = null;
+      job.terminalAtMs = null;
+      job.errorMessage = null;
+      job.attempts = 0;
+      job.updatedAtMs = now;
+      return {
+        result: { ok: true, job: snapshot(job) },
+        events: [{ jobId: job.id, type: "relay_recovered" }],
         changed: true
       };
     },
