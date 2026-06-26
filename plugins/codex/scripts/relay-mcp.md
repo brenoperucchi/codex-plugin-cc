@@ -55,6 +55,39 @@ this server (worker-side `claim`/`complete` and execution arrive in TASK-1.3).
   + a polling fallback); the source of truth is always `resources/read` / `poll`. A missed
   notification only means a late refresh, never a lost job.
 
+## Channel: cross-session "job done" notifications (replaces tmux send-keys)
+
+The relay server is also a **Claude Code channel** (research preview): it can **push** a
+notification into a *running* Claude session when a background job finishes — so the agent
+acts on it without anyone injecting keystrokes into a terminal (the old tmux/`inbox-watcher`
+hack). This is the inherent answer to "how does one CLI session learn a job finished?".
+
+- The session's agent identity comes from the **`RELAY_AGENT`** env var. The channel only
+  emits when it is set; without it the capability is still declared but **nothing is pushed**
+  (never broadcast to the wrong session).
+- The server watches `relay-state.json` and emits `notifications/claude/channel` when:
+  - a **terminal** job (`completed`/`failed`/`needs_recovery`/`cancelled`/`expired`) that
+    **this agent dispatched** (`from === RELAY_AGENT`) finishes, or
+  - a **new `queued`** job lands in this agent's inbox (`to === RELAY_AGENT`).
+- The `dispatch` tool stamps `from = RELAY_AGENT` itself (never trusted from arguments).
+- **Injection guard:** the event content is a minimal envelope (`job_id`, `state`) and tells
+  Claude to treat it as a notification only and call `poll` for the result. The untrusted job
+  result/payload is **never** put in the channel content.
+- Events are de-duplicated (one per logical transition) and seeded at startup (no flood of
+  historical completions). The channel is a **signal**; `poll`/the inbox resource/the durable
+  store remain the source of truth.
+
+**Enabling it** (research preview — needs Claude Code ≥ v2.1.80, Anthropic auth, not
+Bedrock/Vertex):
+
+```bash
+RELAY_AGENT=claude-main claude --dangerously-load-development-channels server:relay
+```
+
+This, together with the worker (TASK-1.3), replaces the fragile transport: **Codex** (a
+server) is *driven* by the worker, and **Claude** (an interactive session) is *woken* by the
+channel — so `inbox-watcher.sh` + `tmux send-keys` are no longer needed.
+
 ## Timeout contract
 
 `dispatch` returns a `job_id` fast; long-running tracking happens via `poll` or an inbox

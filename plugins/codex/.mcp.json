@@ -5,7 +5,8 @@
       "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/relay-mcp-server.mjs"],
       "env": {
         "CLAUDE_PROJECT_DIR": "${CLAUDE_PROJECT_DIR}",
-        "CLAUDE_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}"
+        "CLAUDE_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}",
+        "RELAY_AGENT": "${RELAY_AGENT}"
       }
     }
   }

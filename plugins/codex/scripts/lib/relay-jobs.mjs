@@ -395,7 +395,7 @@ function snapshot(job) {
 
 export function enqueue(
   cwd,
-  { requestId, to = null, payload = null, ttlMs = null, maxAttempts, leaseExpiryPolicy = "requeue" } = {},
+  { requestId, to = null, from = null, payload = null, ttlMs = null, maxAttempts, leaseExpiryPolicy = "requeue" } = {},
   opts = {}
 ) {
   if (!requestId) {
@@ -417,6 +417,7 @@ export function enqueue(
         requestId,
         relayState: "queued",
         to,
+        from,
         payload,
         enqueuedAtMs: now,
         updatedAtMs: now,
