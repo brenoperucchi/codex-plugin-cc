@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-06-25 23:11'
-updated_date: '2026-06-26 14:30'
+updated_date: '2026-06-28 01:00'
 labels:
   - mcp
   - transport
@@ -115,6 +115,10 @@ Resolve a assimetria do doc-2: Codex (servidor) = drivado pelo worker (1.3); Cla
 Dois gates do Codex (plano: solido_com_mudancas, 6 mudanças; código Gate-B: solido_com_mudancas, 4 bugs corrigidos: seed-race → baseline no startup; unsubscribe não desliga o channel; cap/poda do seen-set; sanitização de meta contra injeção). Suíte 364/364.
 
 ACs: #2 (relay roteia handoff via channel+worker), #3 (tmux/inbox-watcher aposentados na doc), #4 (codex-ws mantido), #6 (guia documentado) — CUMPRIDOS. #1/#5 (adaptador do review-loop usar o relay + teste de paridade do output antigo) = FOLLOW-UP não feito (review-loop é gitignored/local; o relay-routing que ele usaria já está pronto). Caveat e2e: o wake real do Claude precisa de `claude --dangerously-load-development-channels server:relay` (research preview, auth Anthropic). Sem commit.
+
+TENTATIVA E2E AUTOMATIZADA do channel wake (2x, headless `claude -p --dangerously-load-development-channels server:relay`, RELAY_AGENT=claude-main): INCONCLUSIVO/NEGATIVO. Mesmo com a sessão ativamente pollando DURANTE a conclusão (poll running→completed + post-checks), nenhum `<channel source=relay>` chegou (CHANNEL_ARRIVED=no nas duas). Causa provável: o modo `-p` processa e sai; channels é desenhado p/ sessão INTERATIVA de longa duração. Não dá p/ descartar detalhe de registro (sem debug log acessível). CONFIRMADO no mesmo run: a flag é aceita, o servidor MCP conecta e a tool `poll` funciona numa sessão Claude real (fachada validada e2e). VEREDITO do channel wake fica para o teste INTERATIVO (runbook) ou investigação futura; a fundentação (relay+fachada+worker) NÃO depende dele e já está provada (worker rodou Codex real; poll funcionou na sessão).
+
+✅ CHANNEL WAKE VALIDADO E2E NUMA SESSÃO INTERATIVA REAL. Setup: `claude --dangerously-load-development-channels server:relay` (build 2.1.193) em ~/relay-channel-test com .mcp.json (RELAY_AGENT=claude-main). Job despachado de claude-main→codex, completado pelo worker (Codex real). A sessão OCIOSA recebeu o push `← relay: Job ... is now completed`, ACORDOU SOZINHA, chamou a tool `poll` e reportou o resultado — sem tmux, sem input do usuário. Confirma o tmux-replacement e RESOLVE o 'problema do gatilho'. (O fracasso anterior na automação era a limitação do headless `-p`, que sai entre turnos — confirmado.) Caveat e2e do channel = FECHADO.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

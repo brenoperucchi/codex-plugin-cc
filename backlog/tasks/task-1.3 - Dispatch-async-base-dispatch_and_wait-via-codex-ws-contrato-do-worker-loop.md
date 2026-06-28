@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-06-25 23:11'
-updated_date: '2026-06-26 13:15'
+updated_date: '2026-06-26 17:28'
 labels:
   - mcp
   - transport
@@ -106,6 +106,8 @@ DECISÃO: execução SEPARADA da fachada de coordenação (guardrail do Codex). 
 Gate-B do PLANO (solido_com_mudancas) → heartbeat por timer, escrita default-deny, write-park, single-flight, timeout-abort, cancel cooperativo. Gate-B do CÓDIGO (solido_com_mudancas) → 4 bugs corrigidos: (1) processJob checa startRunning().ok (não roda se a posse venceu antes de começar); (2) dispatchAndWait com TETO rígido (timeout+grace) não trava com executor não-abortável (turno continua durável em bg); (3) sinal externo (SIGINT) desce até o turno + sono interrompível; (4) TTL de write em execução → needs_recovery (não expired). +6 testes.
 
 ACs #1-7 cumpridos. Caveat e2e: execução REAL do Codex (turno real, escrita, abort real) não roda nos testes (fake injetado); abort real do turno é best-effort (runAppServerTurn sem AbortSignal nativo). worker 18/18; suíte 354/354. Sem commit.
+
+VALIDADO E2E (caveat fechado): smoke real do worker passou — dispatch → drainOnce → `runAppServerTurn` REAL via broker → job completed com output do Codex de verdade ('RELAY SMOKE OK', threadId real, touchedFiles []). Confirma que o caminho de execução (worker + broker + runAppServerTurn) funciona fora dos testes com fake. Codex na PATH; store isolado (CLAUDE_PLUGIN_DATA temp); read-only.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

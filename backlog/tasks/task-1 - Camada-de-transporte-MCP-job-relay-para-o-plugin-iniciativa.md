@@ -4,6 +4,7 @@ title: Camada de transporte MCP / job-relay para o plugin (iniciativa)
 status: To Do
 assignee: []
 created_date: '2026-06-25 22:59'
+updated_date: '2026-06-26 15:01'
 labels:
   - mcp
   - transport
@@ -33,3 +34,9 @@ PRINCÍPIOS (ver doc-1): MCP é fachada, não barramento; base assíncrona (`dis
 
 Esta é a task-pai. O trabalho real está nas subtasks. Está "Done" quando as subtasks de escopo near-term (relay + fachada + dispatch + migração) estiverem Done.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Transporte central (near-term) COMPLETO e em PR. Subtasks 1.1–1.4 Done, 4 commits na branch `feat/mcp-job-relay` (d61c4ca relay · 51e1e45 fachada · 239b9b5 worker · 53e5f35 channel). Suíte 364/364; cada camada passou por 2 gates do Codex (plano+código). PR #1 (feat → main no fork origin): https://github.com/brenoperucchi/codex-plugin-cc/pull/1 — inclui o §21 (design) + o backlog/. Restam: 1.5 (cross-machine, futuro/gated) e o follow-up da 1.4 (#1/#5: adaptador --transport relay no review-loop + paridade). Caveats e2e no corpo do PR (channel wake/discovery/execução real do Codex precisam de install real).
+<!-- SECTION:NOTES:END -->
