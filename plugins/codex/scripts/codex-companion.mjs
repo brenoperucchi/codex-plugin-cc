@@ -7,6 +7,9 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { resolveCodexAutoApprovalPolicy, resolveCodexSandboxMode } from "./lib/codex-config.mjs";
+import { createEventStream, EVENT_TYPES, emitEvent } from "./lib/event-stream.mjs";
+import { handleObserveCommand } from "./lib/observe.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -17,6 +20,9 @@ import {
     interruptAppServerTurn,
     parseStructuredOutput,
     readOutputSchema,
+    resolveReviewTurnIdleTimeoutMs,
+    resolveRunExitStatus,
+    runAppServerInvestigation,
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
@@ -28,6 +34,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveJobsDir,
   setConfig,
   upsertJob,
   writeJobFile
@@ -35,6 +42,7 @@ import {
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  isStreamableProgressLine,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -47,10 +55,11 @@ import {
   createJobRecord,
   createProgressReporter,
   nowIso,
+  resolveSignalFile,
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
-import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { resolveWorkspaceRoot, createWorktree } from "./lib/workspace.mjs";
 import {
   renderNativeReviewResult,
   renderReviewResult,
@@ -64,8 +73,14 @@ import {
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
-const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
+const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 1800000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+// A foreground `task` run observes a detached worker rather than running the
+// Codex turn inline (issue #370). The observer is killed by Claude Code's
+// 10-minute Bash ceiling on long turns, so this timeout is only a backstop for
+// direct CLI use; the worker survives the ceiling regardless.
+const FOREGROUND_OBSERVE_TIMEOUT_MS = 1800000;
+const FOREGROUND_OBSERVE_POLL_INTERVAL_MS = 250;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -80,7 +95,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/codex-companion.mjs observe [job-id] [--cwd <path>]"
     ].join("\n")
   );
 }
@@ -246,6 +262,24 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
+function buildAdversarialInvestigatePrompt(context, focusText) {
+  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review-investigate");
+  return interpolateTemplate(template, {
+    TARGET_LABEL: context.target.label,
+    USER_FOCUS: focusText || "No extra focus provided.",
+    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
+    REVIEW_INPUT: context.content
+  });
+}
+
+function buildAdversarialFinalizePrompt(context, focusText) {
+  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review-finalize");
+  return interpolateTemplate(template, {
+    TARGET_LABEL: context.target.label,
+    USER_FOCUS: focusText || "No extra focus provided."
+  });
+}
+
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -375,7 +409,7 @@ async function executeReviewRun(request) {
       threadId: result.threadId,
       sourceThreadId: result.sourceThreadId,
       codex: {
-        status: result.status,
+        status: resolveRunExitStatus(result, result.reviewText),
         stderr: result.stderr,
         stdout: result.reviewText,
         reasoning: result.reasoningSummary
@@ -391,7 +425,7 @@ async function executeReviewRun(request) {
     );
 
     return {
-      exitStatus: result.status,
+      exitStatus: resolveRunExitStatus(result, result.reviewText),
       threadId: result.threadId,
       turnId: result.turnId,
       payload,
@@ -404,18 +438,122 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
-    prompt,
-    model: request.model,
-    sandbox: "read-only",
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
-  });
-  const parsed = parseStructuredOutput(result.finalMessage, {
+
+  // Nothing to review. The common trigger is running on a clean working tree
+  // while sitting ON the default branch: the branch comparison resolves
+  // merge-base == HEAD, so the diff is empty. Feeding an empty diff to the
+  // model just burns reasoning tokens and returns nothing useful (it cannot
+  // find issues in code that did not change). Short-circuit to an approve
+  // verdict without calling the model.
+  if (context.fileCount === 0) {
+    const emptyVerdict = {
+      verdict: "approve",
+      summary: `No changes to review for ${target.label}.`,
+      findings: [],
+      next_steps: []
+    };
+    const parsed = {
+      parsed: emptyVerdict,
+      parseError: null,
+      rawOutput: JSON.stringify(emptyVerdict)
+    };
+    const payload = {
+      review: reviewName,
+      target,
+      threadId: null,
+      context: {
+        repoRoot: context.repoRoot,
+        branch: context.branch,
+        summary: context.summary
+      },
+      codex: { status: 0, stderr: "", stdout: "", reasoning: [] },
+      result: parsed.parsed,
+      rawOutput: parsed.rawOutput,
+      parseError: null,
+      failed: false,
+      failureMessage: null,
+      reasoningSummary: []
+    };
+    return {
+      exitStatus: 0,
+      threadId: null,
+      turnId: null,
+      payload,
+      rendered: renderReviewResult(parsed, {
+        reviewLabel: reviewName,
+        targetLabel: target.label,
+        reasoningSummary: []
+      }),
+      summary: emptyVerdict.summary,
+      jobTitle: `Codex ${reviewName}`,
+      jobClass: "review",
+      targetLabel: target.label
+    };
+  }
+
+  let result;
+  if (context.inputMode === "self-collect") {
+    const investigatePrompt = buildAdversarialInvestigatePrompt(context, focusText);
+    const finalizePrompt = buildAdversarialFinalizePrompt(context, focusText);
+    result = await runAppServerInvestigation(context.repoRoot, {
+      investigatePrompt,
+      finalizePrompt,
+      outputSchema: readOutputSchema(REVIEW_SCHEMA),
+      model: request.model,
+      sandbox: "read-only",
+      maxInvestigationTurns: request.maxInvestigationTurns,
+      turnIdleTimeoutMs: request.turnIdleTimeoutMs,
+      onProgress: request.onProgress
+    });
+  } else {
+    const prompt = buildAdversarialReviewPrompt(context, focusText);
+    result = await runAppServerTurn(context.repoRoot, {
+      prompt,
+      model: request.model,
+      sandbox: "read-only",
+      outputSchema: readOutputSchema(REVIEW_SCHEMA),
+      turnIdleTimeoutMs: request.turnIdleTimeoutMs,
+      onProgress: request.onProgress
+    });
+  }
+  // Parse first, then decide. A run can carry a non-zero status / error from a
+  // transient reconnect yet still have produced valid structured output (the
+  // turn recovered) — mirror of fix #1 at the finalize boundary. Only report a
+  // failure when the run errored AND we have no usable structured verdict;
+  // otherwise the leftover prose would be JSON-parsed into a misleading
+  // "invalid JSON" error, or a recovered valid verdict would be discarded.
+  const runErrored = Boolean(result.error) || result.status !== 0;
+  const hasFinalMessage = Boolean(String(result.finalMessage ?? "").trim());
+  const structured = parseStructuredOutput(result.finalMessage, {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
+  let parsed;
+  if (runErrored && !structured.parsed) {
+    parsed = {
+      parsed: null,
+      parseError: null,
+      failed: true,
+      failureMessage:
+        result.error?.message ?? result.stderr ?? "Codex run failed before producing output.",
+      rawOutput: result.finalMessage ?? ""
+    };
+  } else if (!hasFinalMessage && !structured.parsed) {
+    // The turn completed (status 0, no error) but emitted no agent message —
+    // only reasoning, or nothing at all. This is NOT a malformed-JSON parse
+    // error (there is nothing to parse); reporting it as one renders an empty
+    // "- Parse error:" line. Flag it as a no-content failure so the renderer
+    // states the run could not complete and surfaces any reasoning instead.
+    parsed = {
+      parsed: null,
+      parseError: null,
+      failed: true,
+      failureMessage: "Codex completed the turn but returned no review content.",
+      rawOutput: ""
+    };
+  } else {
+    parsed = structured;
+  }
   const payload = {
     review: reviewName,
     target,
@@ -434,20 +572,34 @@ async function executeReviewRun(request) {
     result: parsed.parsed,
     rawOutput: parsed.rawOutput,
     parseError: parsed.parseError,
+    failed: parsed.failed ?? false,
+    failureMessage: parsed.failureMessage ?? null,
     reasoningSummary: result.reasoningSummary
   };
+  if (result.investigation) {
+    payload.investigation = result.investigation;
+  }
+
+  // A recovered finalize turn (transient reconnect/error, but valid structured
+  // output) carries a stale non-zero `result.status` from buildResultStatus.
+  // Since we produced a usable verdict and did not flag the run failed, exit
+  // success — otherwise the foreground command exits non-zero and background
+  // jobs are recorded as failed despite a valid review. Conversely, a genuinely
+  // failed run keeps its non-zero status.
+  const exitStatus = (!payload.failed && parsed.parsed) ? 0 : result.status;
 
   return {
-    exitStatus: result.status,
+    exitStatus,
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
     rendered: renderReviewResult(parsed, {
       reviewLabel: reviewName,
       targetLabel: context.target.label,
-      reasoningSummary: result.reasoningSummary
+      reasoningSummary: result.reasoningSummary,
+      investigation: result.investigation ?? null
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    summary: parsed.parsed?.summary ?? parsed.failureMessage ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label
@@ -457,6 +609,7 @@ async function executeReviewRun(request) {
 
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
+  const codexCwd = request.worktreePath ?? workspaceRoot;
   ensureCodexAvailable(request.cwd);
 
   const taskMetadata = buildTaskRunMetadata({
@@ -479,13 +632,14 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
-  const result = await runAppServerTurn(workspaceRoot, {
+  const result = await runAppServerTurn(codexCwd, {
     resumeThreadId,
     prompt: request.prompt,
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    sandbox: resolveCodexSandboxMode(workspaceRoot) ?? (request.write ? "workspace-write" : "read-only"),
+    approvalPolicy: request.write ? resolveCodexAutoApprovalPolicy(workspaceRoot) : null,
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -502,19 +656,26 @@ async function executeTaskRun(request) {
     {
       title: taskMetadata.title,
       jobId: request.jobId ?? null,
-      write: Boolean(request.write)
+      write: Boolean(request.write),
+      worktreePath: request.worktreePath ?? null,
+      worktreeBranch: request.worktreeBranch ?? null,
+      worktreeBaseBranch: request.worktreeBaseBranch ?? null
     }
   );
+  const exitStatus = resolveRunExitStatus(result, result.finalMessage);
   const payload = {
-    status: result.status,
+    status: exitStatus,
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    worktreePath: request.worktreePath ?? null,
+    worktreeBranch: request.worktreeBranch ?? null,
+    worktreeBaseBranch: request.worktreeBaseBranch ?? null
   };
 
   return {
-    exitStatus: result.status,
+    exitStatus,
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
@@ -551,7 +712,17 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 }
 
 function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
+  const lines = [`${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.`];
+  if (payload.worktreePath) {
+    lines.push(`  Worktree: ${payload.worktreePath}`);
+    if (payload.worktreeBranch) {
+      lines.push(`  Branch:   ${payload.worktreeBranch}`);
+    }
+  }
+  if (payload.signalFile) {
+    lines.push(`  Signal:   ${payload.signalFile}`);
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 function getJobKindLabel(kind, jobClass) {
@@ -561,9 +732,9 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, id }) {
   return createJobRecord({
-    id: generateJobId(prefix),
+    id: id ?? generateJobId(prefix),
     kind,
     kindLabel: getJobKindLabel(kind, jobClass),
     title,
@@ -576,29 +747,46 @@ function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summ
 
 function createTrackedProgress(job, options = {}) {
   const logFile = options.logFile ?? createJobLogFile(job.workspaceRoot, job.id, job.title);
+  const jobsDir = resolveJobsDir(job.workspaceRoot);
+  const eventStream = createEventStream(job.id, jobsDir);
   return {
     logFile,
+    eventFile: eventStream.eventFile,
+    eventStream,
     progress: createProgressReporter({
       stderr: Boolean(options.stderr),
       logFile,
+      eventStream,
       onEvent: createJobProgressUpdater(job.workspaceRoot, job.id)
     })
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
-  return createCompanionJob({
+function buildTaskJob(workspaceRoot, taskMetadata, write, worktreeInfo = null, id = null) {
+  const base = createCompanionJob({
     prefix: "task",
     kind: "task",
     title: taskMetadata.title,
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
-    write
+    write,
+    id
   });
+
+  if (!worktreeInfo) {
+    return base;
+  }
+
+  return {
+    ...base,
+    worktreePath: worktreeInfo.worktreePath,
+    worktreeBranch: worktreeInfo.worktreeBranch,
+    worktreeBaseBranch: worktreeInfo.worktreeBaseBranch
+  };
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId, worktreePath = null, worktreeBranch = null, worktreeBaseBranch = null }) {
   return {
     cwd,
     model,
@@ -606,7 +794,10 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    worktreePath,
+    worktreeBranch,
+    worktreeBaseBranch
   };
 }
 
@@ -626,11 +817,18 @@ function requireTaskRequest(prompt, resumeLast) {
 }
 
 async function runForegroundCommand(job, runner, options = {}) {
-  const { logFile, progress } = createTrackedProgress(job, {
+  const { logFile, eventFile, eventStream, progress } = createTrackedProgress(job, {
     logFile: options.logFile,
     stderr: !options.json
   });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  const execution = await runTrackedJob(job, () => runner(progress), { logFile, eventFile });
+  if (eventStream) {
+    emitEvent(eventStream, EVENT_TYPES.COMPLETED, {
+      status: execution.exitStatus === 0 ? "success" : "failure",
+      phase: execution.exitStatus === 0 ? "done" : "failed",
+      summary: execution.summary ?? null
+    });
+  }
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
@@ -651,21 +849,34 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
-  const { logFile } = createTrackedProgress(job);
-  appendLogLine(logFile, "Queued for background execution.");
+function enqueueDetachedTask(cwd, job, request) {
+  const { logFile, eventFile } = createTrackedProgress(job);
+  appendLogLine(logFile, "Queued for execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  const jobsDir = resolveJobsDir(job.workspaceRoot);
+  const signalFile = resolveSignalFile(jobsDir, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
+    eventFile,
+    signalFile,
     request
   };
+  // Persist the full record (including the request payload) BEFORE spawning so
+  // the detached worker always finds it when it boots and reads the job file.
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  if (child.pid != null) {
+    // Record the worker pid so /codex:cancel can reach a job that has not
+    // transitioned to "running" yet. child.pid is the worker's own process.pid,
+    // so this only patches pid and never clobbers the worker's status writes.
+    upsertJob(job.workspaceRoot, { id: job.id, pid: child.pid });
+  }
 
   return {
     payload: {
@@ -673,20 +884,190 @@ function enqueueBackgroundTask(cwd, job, request) {
       status: "queued",
       title: job.title,
       summary: job.summary,
-      logFile
+      logFile,
+      eventFile,
+      jobsDir,
+      signalFile,
+      worktreePath: job.worktreePath ?? null,
+      worktreeBranch: job.worktreeBranch ?? null
     },
     logFile
   };
 }
 
+function ensureTrailingNewline(text) {
+  const value = String(text ?? "");
+  return value.endsWith("\n") ? value : `${value}\n`;
+}
+
+function streamJobLogTail(logFile, fromOffset) {
+  if (!logFile || !fs.existsSync(logFile)) {
+    return fromOffset;
+  }
+  let stat;
+  try {
+    stat = fs.statSync(logFile);
+  } catch {
+    return fromOffset;
+  }
+  if (stat.size <= fromOffset) {
+    return fromOffset;
+  }
+  let fd = null;
+  try {
+    fd = fs.openSync(logFile, "r");
+    const length = stat.size - fromOffset;
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, fromOffset);
+    const chunk = buffer.toString("utf8");
+    // Only consume complete lines; leave any partial trailing line for the next
+    // poll so a line is never split or filtered on incomplete content.
+    const lastNewline = chunk.lastIndexOf("\n");
+    if (lastNewline === -1) {
+      return fromOffset;
+    }
+    const consumed = chunk.slice(0, lastNewline + 1);
+    // Echo only progress lines — never the persisted block bodies (assistant
+    // message, Final output, reasoning), which are rendered on stdout instead.
+    // Streaming them here would duplicate Codex's answer onto stderr (#372).
+    const progress = consumed
+      .split("\n")
+      .filter((line) => isStreamableProgressLine(line))
+      .map((line) => `${line}\n`)
+      .join("");
+    if (progress) {
+      process.stderr.write(progress);
+    }
+    return fromOffset + Buffer.byteLength(consumed, "utf8");
+  } catch {
+    return fromOffset;
+  } finally {
+    if (fd != null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close failures while tailing.
+      }
+    }
+  }
+}
+
+// Observe a task whose Codex turn runs in a detached worker (spawnDetachedTaskWorker).
+// The worker runs in its own session, so it survives Claude Code's 10-minute Bash
+// ceiling; this foreground observer streams the worker's log and waits for it to
+// finish, preserving live output and the synchronous stdout the rescue subagent and
+// stop hook expect. If the harness kills this observer at the ceiling, the worker
+// keeps running, records completion, and the result stays retrievable via
+// `/codex:result <jobId>` instead of dying silently (issue #370).
+async function observeDetachedTask(cwd, job, options = {}) {
+  const asJson = Boolean(options.json);
+  const jobId = job.id;
+  const workspaceRoot = job.workspaceRoot;
+  const logFile = job.logFile ?? null;
+
+  if (!asJson) {
+    process.stderr.write(
+      `[codex] ${job.title ?? "Codex task"} dispatched as ${jobId}. ` +
+        "Streaming progress below; if this run is interrupted before it finishes, " +
+        `retrieve the result later with \`/codex:result ${jobId}\`.\n`
+    );
+  }
+
+  const deadline = Date.now() + FOREGROUND_OBSERVE_TIMEOUT_MS;
+  let logOffset = asJson ? 0 : streamJobLogTail(logFile, 0);
+  let snapshot = buildSingleJobSnapshot(cwd, jobId);
+
+  while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
+    await sleep(Math.min(FOREGROUND_OBSERVE_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+    if (!asJson) {
+      logOffset = streamJobLogTail(logFile, logOffset);
+    }
+    snapshot = buildSingleJobSnapshot(cwd, jobId);
+  }
+  if (!asJson) {
+    streamJobLogTail(logFile, logOffset);
+  }
+
+  if (isActiveJobStatus(snapshot.job.status)) {
+    // The observer gave up waiting, but the detached worker is still running.
+    if (asJson) {
+      outputResult({ jobId, status: snapshot.job.status, waitTimedOut: true, job: snapshot.job }, true);
+    } else {
+      process.stdout.write(
+        `Codex job ${jobId} is still running. Retrieve the result later with \`/codex:result ${jobId}\`.\n`
+      );
+    }
+    return snapshot;
+  }
+
+  const status = snapshot.job.status;
+  const storedJob = readStoredJob(workspaceRoot, jobId);
+  const renderedText =
+    storedJob && typeof storedJob.rendered === "string" && storedJob.rendered.length > 0
+      ? storedJob.rendered
+      : null;
+
+  if (status === "completed") {
+    if (asJson) {
+      outputResult(storedJob?.result ?? { job: snapshot.job }, true);
+    } else {
+      process.stdout.write(ensureTrailingNewline(renderedText ?? renderStoredJobResult(snapshot.job, storedJob)));
+    }
+    return snapshot;
+  }
+
+  // Failed or cancelled.
+  if (renderedText) {
+    // Codex produced output but reported a non-zero status — surface it exactly
+    // as the old inline foreground path did.
+    if (asJson) {
+      outputResult(storedJob?.result ?? { job: snapshot.job }, true);
+    } else {
+      process.stdout.write(ensureTrailingNewline(renderedText));
+    }
+  } else {
+    // The turn failed before producing output — mirror the inline `main().catch`
+    // behaviour and report the error on stderr with a non-zero exit code.
+    const message =
+      storedJob?.errorMessage ?? snapshot.job.errorMessage ?? `Codex job ${jobId} ${status} before producing output.`;
+    process.stderr.write(`${message}\n`);
+  }
+
+  const exitStatus = Number(storedJob?.result?.status);
+  process.exitCode = Number.isFinite(exitStatus) && exitStatus !== 0 ? exitStatus : 1;
+  return snapshot;
+}
+
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "max-investigation-turns", "turn-idle-timeout"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
     }
   });
+
+  const rawMaxTurns = options["max-investigation-turns"];
+  let maxInvestigationTurns;
+  if (rawMaxTurns !== undefined) {
+    if (!/^[1-9][0-9]*$/.test(String(rawMaxTurns))) {
+      throw new Error(`--max-investigation-turns must be a positive integer (got: ${rawMaxTurns})`);
+    }
+    maxInvestigationTurns = Number(rawMaxTurns);
+  }
+
+  const rawIdleTimeout = options["turn-idle-timeout"];
+  let explicitIdleTimeoutMs;
+  if (rawIdleTimeout !== undefined) {
+    if (!/^[1-9][0-9]*$/.test(String(rawIdleTimeout))) {
+      throw new Error(`--turn-idle-timeout must be a positive integer (seconds) (got: ${rawIdleTimeout})`);
+    }
+    explicitIdleTimeoutMs = Number(rawIdleTimeout) * 1000;
+  }
+  // Reviews always get an idle watchdog (default when no flag is given), so a
+  // stalled review never hangs forever. /codex:task deliberately does NOT, so a
+  // long-thinking task is not aborted; it passes no timeout to runAppServerTurn.
+  const turnIdleTimeoutMs = resolveReviewTurnIdleTimeoutMs(explicitIdleTimeoutMs);
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -716,6 +1097,8 @@ async function handleReviewCommand(argv, config) {
         model: options.model,
         focusText,
         reviewName: config.reviewName,
+        maxInvestigationTurns,
+        turnIdleTimeoutMs,
         onProgress: progress
       }),
     { json: options.json }
@@ -732,7 +1115,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "worktree"],
     aliasMap: {
       m: "model"
     }
@@ -746,8 +1129,12 @@ async function handleTask(argv) {
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
+  const worktree = Boolean(options.worktree);
   if (resumeLast && fresh) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
+  }
+  if (worktree && resumeLast) {
+    throw new Error("Choose either --worktree or --resume/--resume-last.");
   }
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
@@ -755,11 +1142,19 @@ async function handleTask(argv) {
     resumeLast
   });
 
+  // Create worktree if requested (before job creation so we have the path)
+  let worktreeInfo = null;
+  let preassignedJobId = null;
+  if (worktree) {
+    preassignedJobId = generateJobId("task");
+    worktreeInfo = createWorktree(workspaceRoot, preassignedJobId, prompt);
+  }
+
   if (options.background) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, worktreeInfo, preassignedJobId);
     const request = buildTaskRequest({
       cwd,
       model,
@@ -767,29 +1162,38 @@ async function handleTask(argv) {
       prompt,
       write,
       resumeLast,
-      jobId: job.id
+      jobId: job.id,
+      worktreePath: worktreeInfo?.worktreePath ?? null,
+      worktreeBranch: worktreeInfo?.worktreeBranch ?? null,
+      worktreeBaseBranch: worktreeInfo?.worktreeBaseBranch ?? null
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = enqueueDetachedTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  // Foreground (default): dispatch to the same detached worker the background
+  // path uses, then observe it. The worker survives Claude Code's 10-minute Bash
+  // ceiling, so a long turn no longer dies silently mid-run — it finishes in the
+  // worker and stays retrievable via /codex:result (issue #370).
+  ensureCodexAvailable(cwd);
+  requireTaskRequest(prompt, resumeLast);
+
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, worktreeInfo, preassignedJobId);
+  const request = buildTaskRequest({
+    cwd,
+    model,
+    effort,
+    prompt,
+    write,
+    resumeLast,
+    jobId: job.id,
+    worktreePath: worktreeInfo?.worktreePath ?? null,
+    worktreeBranch: worktreeInfo?.worktreeBranch ?? null,
+    worktreeBaseBranch: worktreeInfo?.worktreeBaseBranch ?? null
+  });
+  const { logFile } = enqueueDetachedTask(cwd, job, request);
+  await observeDetachedTask(cwd, { ...job, logFile }, { json: options.json });
 }
 
 async function handleTaskWorker(argv) {
@@ -813,7 +1217,7 @@ async function handleTaskWorker(argv) {
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
   }
 
-  const { logFile, progress } = createTrackedProgress(
+  const { logFile, eventFile, eventStream, progress } = createTrackedProgress(
     {
       ...storedJob,
       workspaceRoot
@@ -822,19 +1226,27 @@ async function handleTaskWorker(argv) {
       logFile: storedJob.logFile ?? null
     }
   );
-  await runTrackedJob(
+  const execution = await runTrackedJob(
     {
       ...storedJob,
       workspaceRoot,
-      logFile
+      logFile,
+      eventFile
     },
     () =>
       executeTaskRun({
         ...request,
         onProgress: progress
       }),
-    { logFile }
+    { logFile, eventFile }
   );
+  if (eventStream) {
+    emitEvent(eventStream, EVENT_TYPES.COMPLETED, {
+      status: execution.exitStatus === 0 ? "success" : "failure",
+      phase: execution.exitStatus === 0 ? "done" : "failed",
+      summary: execution.summary ?? null
+    });
+  }
 }
 
 async function handleStatus(argv) {
@@ -930,7 +1342,7 @@ async function handleCancel(argv) {
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  const interrupt = await interruptAppServerTurn(workspaceRoot, { threadId, turnId });
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -1014,6 +1426,9 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "observe":
+      await handleObserveCommand(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
